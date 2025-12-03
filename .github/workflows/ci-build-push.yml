@@ -1,6 +1,6 @@
 
 permissions:
-  id-token: write    # Required for OIDC
+  id-token: write
   contents: read
 
 name: CI – Build & Push to ACR
@@ -22,46 +22,39 @@ on:
 
 env:
   ACR_NAME: mydockeracrtst
-  IMAGE_NAME: webapp                 # <-- set this to your app image name
-  IMAGE_TAG: ${{ github.sha }}       # immutable tag based on commit
+  IMAGE_NAME: webapp
+  IMAGE_TAG: ${{ github.sha }}
   PUSH_LATEST: true
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # If you still want Azure login for other az commands (not required for Docker)
-      
-      
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}       # App (client) ID
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}       # Tenant ID
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          enable-AzPSSession: true
+          # Do NOT set auth-type. Do NOT set enable-AzPSSession unless you need PowerShell.
+          # enable-AzPSSession: false
 
-
-
-      # 🔐 Log in to ACR with admin credentials (bypasses az acr login)
-      - name: Docker login to ACR
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
-            ${{ env.ACR_NAME }}.azurecr.io \
-            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+      - name: Login to ACR via Azure CLI
+        run: az acr login --name $ACR_NAME
 
       - name: Build Docker image
-        run: |
-          docker build -t $ACR_NAME.azurecr.io/$IMAGE_NAME:$IMAGE_TAG .
+        run: docker build -t $ACR_NAME.azurecr.io/$IMAGE_NAME:$IMAGE_TAG .
 
       - name: (Optional) Tag as latest
         if: env.PUSH_LATEST == 'true'
-        run: |
-          docker tag $ACR_NAME.azurecr.io/$IMAGE_NAME:$IMAGE_TAG $ACR_NAME.azurecr.io/$IMAGE_NAME:latest
+        run: docker tag $ACR_NAME.azurecr.io/$IMAGE_NAME:$IMAGE_TAG $ACR_NAME.azurecr.io/$IMAGE_NAME:latest
 
       - name: Push image(s) to ACR
         run: |
@@ -72,4 +65,4 @@ jobs:
 
       - name: Set output (image reference)
         id: meta
-        run: |
+        run: echo "image=${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
