@@ -37,8 +37,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug environment
-        run: env | grep AZURE
+      
+      - name: Debug environment (AZURE vars)
+        run: |
+          echo "---- Listing AZURE* env vars ----"
+          env | grep -E '^AZURE' || echo "No AZURE* env vars found"
+          echo "---- Dump all env to file ----"
+          printenv | sort > env_dump.txt
+
+      - name: Upload env dump artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-dump
+          path: env_dump.txt
+
 
 
       - name: Azure Login (OIDC)
