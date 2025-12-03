@@ -36,13 +36,15 @@ jobs:
 
       # If you still want Azure login for other az commands (not required for Docker)
       
+      
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
-          auth-type: 'id-token'
           client-id: ${{ secrets.AZURE_CLIENT_ID }}       # App (client) ID
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}       # Tenant ID
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
 
 
       # 🔐 Log in to ACR with admin credentials (bypasses az acr login)
