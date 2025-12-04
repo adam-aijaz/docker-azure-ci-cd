@@ -1,5 +1,5 @@
 
-name: CI – Deploy to AKS
+name: CI – Deploy to AKS (Admin Secret Pull)
 
 on:
   workflow_dispatch:
@@ -18,10 +18,16 @@ permissions:
   contents: read
 
 env:
+  # ---- Azure + AKS configuration ----
   RESOURCE_GROUP: rg-docker-ci
   CLUSTER_NAME: mydockercls
+  LOCATION: australiaeast
+
+  # ---- Container registry + image ----
   ACR_NAME: mydockeracrtst
   IMAGE_NAME: webapp
+
+  # ---- Kubernetes manifests directory ----
   MANIFEST_DIR: k8s
 
 jobs:
@@ -38,11 +44,6 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}       # github-oidc-sp client ID
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Verify ACR via token
-        run: |
-          TOKEN=$(az acr login --name $ACR_NAME --expose-token --query accessToken -o tsv)
-          curl -sH "Authorization: Bearer $TOKEN" "https://${ACR_NAME}.azurecr.io/v2/_catalog"
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v3
@@ -68,46 +69,40 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --overwrite-existing
 
-      - name: Ensure AcrPull is assigned to AKS kubelet identity (idempotent)
+      # --- Admin-secret approach: bypass RBAC/ABAC entirely ---
+      - name: Enable ACR admin user (idempotent)
         run: |
-          set -e
-          echo "Fetching kubelet identity objectId..."
-          KUBELET_OID=$(az aks show \
-            --name "$CLUSTER_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query "identityProfile.kubeletidentity.objectId" -o tsv)
-          echo "KUBELET_OID=$KUBELET_OID"
+          az acr update -n "$ACR_NAME" --admin-enabled true
 
-          echo "Fetching ACR resource ID..."
-          ACR_ID=$(az acr show --name "$ACR_NAME" --query id -o tsv)
-          echo "ACR_ID=$ACR_ID"
-
-          echo "Checking existing AcrPull assignment..."
-          ASSIGNED=$(az role assignment list \
-            --assignee-object-id "$KUBELET_OID" \
-            --scope "$ACR_ID" \
-            --query "[?roleDefinitionName=='AcrPull']" -o tsv)
-
-          if [ -z "$ASSIGNED" ]; then
-            echo "AcrPull not assigned. Assigning now..."
-            az role assignment create \
-              --assignee-object-id "$KUBELET_OID" \
-              --role AcrPull \
-              --scope "$ACR_ID" \
-              --assignee-principal-type ServicePrincipal
-            echo "AcrPull assigned."
-          else
-            echo "AcrPull already assigned."
-          fi
-
-      - name: Create namespace (if not exists)
+      - name: Create/Update imagePullSecret from ACR admin creds
         run: |
+          USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
+          PASS=$(az acr credential show -n "$ACR_NAME" --query passwords[0].value -o tsv)
+
+          # Ensure namespace exists
           kubectl get ns "${{ steps.vars.outputs.NAMESPACE }}" >/dev/null 2>&1 || \
           kubectl create namespace "${{ steps.vars.outputs.NAMESPACE }}"
+
+          # Recreate secret to keep it fresh
+          kubectl delete secret acr-creds -n "${{ steps.vars.outputs.NAMESPACE }}" --ignore-not-found
+
+          kubectl create secret docker-registry acr-creds \
+            --docker-server="${ACR_NAME}.azurecr.io" \
+            --docker-username="$USER" \
+            --docker-password="$PASS" \
+            -n "${{ steps.vars.outputs.NAMESPACE }}"
 
       - name: Apply Kubernetes manifests
         run: |
           kubectl apply -n "${{ steps.vars.outputs.NAMESPACE }}" -f "${MANIFEST_DIR}"
+
+      - name: Ensure Deployment uses imagePullSecrets=acr-creds (server-side patch)
+        run: |
+          DEPLOYMENT_NAME="webapp"
+          kubectl patch deployment "${DEPLOYMENT_NAME}" \
+            -n "${{ steps.vars.outputs.NAMESPACE }}" \
+            --type='strategic' \
+            -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"acr-creds"}]}}}}'
 
       - name: Set deployment image to requested tag
         run: |
@@ -140,3 +135,9 @@ jobs:
           done
           echo "---- Recent events ----"
           kubectl get events -n "${{ steps.vars.outputs.NAMESPACE }}" --sort-by=.lastTimestamp || true
+
+      - name: Output image reference (for downstream jobs)
+        id: meta
+        run: |
+          echo "image=${{ steps.vars.outputs.IMAGE }}" >> $GITHUB_OUTPUT
+          echo "namespace=${{ steps.vars.outputs.NAMESPACE }}" >> $GITHUB_OUTPUT
