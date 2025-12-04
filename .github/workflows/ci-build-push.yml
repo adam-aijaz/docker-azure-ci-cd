@@ -38,6 +38,9 @@ jobs:
         uses: actions/checkout@v4
 
       
+      - name: Check ACR connectivity
+        run: curl -I https://${{ env.ACR_NAME }}.azurecr.io/v2/
+
       - name: Debug environment (AZURE vars)
         run: |
           echo "---- Listing AZURE* env vars ----"
