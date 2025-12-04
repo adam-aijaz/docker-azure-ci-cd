@@ -39,6 +39,11 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Verify ACR via token
+        run: |
+          TOKEN=$(az acr login --name $ACR_NAME --expose-token --query accessToken -o tsv)
+          curl -sH "Authorization: Bearer $TOKEN" "https://${ACR_NAME}.azurecr.io/v2/_catalog"
+
       - name: Setup kubectl
         uses: azure/setup-kubectl@v3
         with:
