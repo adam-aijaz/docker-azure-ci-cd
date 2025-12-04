@@ -12,30 +12,21 @@ on:
         description: "Kubernetes namespace to deploy into"
         required: true
         default: "prod"
-  # Optionally auto-deploy after build workflow completes:
-  # workflow_run:
-  #   workflows: ["CI – Build & Push to ACR"]
-  #   types: [completed]
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
-  # ---- Azure + AKS configuration ----
   RESOURCE_GROUP: rg-docker-ci
   CLUSTER_NAME: mydockercls
-  LOCATION: australiaeast
-
-  # ---- Container registry + image ----
   ACR_NAME: mydockeracrtst
   IMAGE_NAME: webapp
-
-  # ---- Kubernetes manifests directory ----
   MANIFEST_DIR: k8s
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write     # required for azure/login OIDC
-      contents: read
 
     steps:
       - name: Checkout
@@ -72,21 +63,37 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --overwrite-existing
 
-      # --- Ensures AKS can pull from ACR (idempotent). Requires Owner/User Access Admin on subscription (your SP has it) ---
-      - name: Ensure ACR is attached to AKS
-        run: |
-          echo "Attaching ACR '$ACR_NAME' to AKS '$CLUSTER_NAME' (idempotent)..."
-          az aks update \
-            --name "$CLUSTER_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --attach-acr "$ACR_NAME"
-
-      - name: Check ACR reachability from runner (sanity)
+      - name: Ensure AcrPull is assigned to AKS kubelet identity (idempotent)
         run: |
           set -e
-          echo "Checking public reachability to ACR..."
-          nslookup "${ACR_NAME}.azurecr.io" || true
-          curl -I "https://${ACR_NAME}.azurecr.io/v2/" || true
+          echo "Fetching kubelet identity objectId..."
+          KUBELET_OID=$(az aks show \
+            --name "$CLUSTER_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "identityProfile.kubeletidentity.objectId" -o tsv)
+          echo "KUBELET_OID=$KUBELET_OID"
+
+          echo "Fetching ACR resource ID..."
+          ACR_ID=$(az acr show --name "$ACR_NAME" --query id -o tsv)
+          echo "ACR_ID=$ACR_ID"
+
+          echo "Checking existing AcrPull assignment..."
+          ASSIGNED=$(az role assignment list \
+            --assignee-object-id "$KUBELET_OID" \
+            --scope "$ACR_ID" \
+            --query "[?roleDefinitionName=='AcrPull']" -o tsv)
+
+          if [ -z "$ASSIGNED" ]; then
+            echo "AcrPull not assigned. Assigning now..."
+            az role assignment create \
+              --assignee-object-id "$KUBELET_OID" \
+              --role AcrPull \
+              --scope "$ACR_ID" \
+              --assignee-principal-type ServicePrincipal
+            echo "AcrPull assigned."
+          else
+            echo "AcrPull already assigned."
+          fi
 
       - name: Create namespace (if not exists)
         run: |
@@ -95,12 +102,10 @@ jobs:
 
       - name: Apply Kubernetes manifests
         run: |
-          # Apply all YAML files under k8s/ (Deployment, Service, Ingress, etc.)
           kubectl apply -n "${{ steps.vars.outputs.NAMESPACE }}" -f "${MANIFEST_DIR}"
 
       - name: Set deployment image to requested tag
         run: |
-          # Adjust names if your deployment/container differ from 'webapp'
           DEPLOYMENT_NAME="webapp"
           CONTAINER_NAME="webapp"
           kubectl set image deployment/${DEPLOYMENT_NAME} \
@@ -130,9 +135,3 @@ jobs:
           done
           echo "---- Recent events ----"
           kubectl get events -n "${{ steps.vars.outputs.NAMESPACE }}" --sort-by=.lastTimestamp || true
-
-      - name: Output image reference (for downstream jobs)
-        id: meta
-        run: |
-          echo "image=${{ steps.vars.outputs.IMAGE }}" >> $GITHUB_OUTPUT
-          echo "namespace=${{ steps.vars.outputs.NAMESPACE }}" >> $GITHUB_OUTPUT
