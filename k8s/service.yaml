@@ -4,8 +4,6 @@ kind: Service
 metadata:
   name: webapp
   namespace: prod
-  labels:
-    app: webapp
 spec:
   type: ClusterIP
   selector:
@@ -13,4 +11,5 @@ spec:
   ports:
     - name: http
       port: 80
-      targetPort: 80
+      targetPort: 8085
+

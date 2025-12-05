@@ -18,27 +18,24 @@ spec:
     spec:
       imagePullSecrets:
         - name: acr-creds
+      
       containers:
         - name: webapp
           image: mydockeracrtst.azurecr.io/webapp:latest
           ports:
-            - containerPort: 80
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+            - containerPort: 8085
+          env:
+            - name: PORT
+              value: "8085"
           readinessProbe:
             httpGet:
               path: /
-              port: 80
-            initialDelaySeconds: 5
+              port: 8085
+            initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /
-              port: 80
-            initialDelaySeconds: 15
-            periodSeconds: 20
+              port: 8085
+            initialDelaySeconds: 30
+            periodSeconds: 15
