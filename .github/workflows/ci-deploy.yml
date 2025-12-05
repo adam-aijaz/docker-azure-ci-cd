@@ -1,5 +1,5 @@
 
-name: CI – Deploy to AKS (Admin Secret Pull)
+name: CI – Deploy to AKS (with External IP wait + Smoke Test)
 
 on:
   workflow_dispatch:
@@ -18,12 +18,26 @@ permissions:
   contents: read
 
 env:
+  # ---- Azure + AKS configuration ----
   RESOURCE_GROUP: rg-docker-ci
   CLUSTER_NAME: mydockercls
+
+  # ---- Container registry + image ----
   ACR_NAME: mydockeracrtst
   IMAGE_NAME: webapp
+
+  # ---- Kubernetes manifests directory ----
   MANIFEST_DIR: k8s
-  OPEN_AKS_API: "true"   # set to "true" if you want to clear authorized IP ranges automatically
+
+  # ---- Service exposure options ----
+  # Set to "true" to annotate the Service to use an existing static public IP.
+  USE_STATIC_IP: "false"
+  # Name of the public IP resource (Standard SKU) if using static IP.
+  STATIC_IP_NAME: "myStaticIP"
+  # Resource group of the public IP (often same as AKS RG; change if different).
+  LB_RESOURCE_GROUP: "rg-docker-ci"
+  # Optional DNS (if you later set Azure DNS or a custom DNS mapping to the static IP).
+  FRIENDLY_HOSTNAME: ""   # e.g., "webapp.example.com"
 
 jobs:
   deploy:
@@ -57,36 +71,16 @@ jobs:
           echo "Resolved image: $IMAGE"
           echo "Namespace: $NAMESPACE"
 
-      # ---------- Connectivity pre-check ----------
-      - name: Check AKS API access settings
-        run: |
-          API_JSON=$(az aks show -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" --query apiServerAccessProfile -o json)
-          echo "$API_JSON" | jq .
-          ENABLE_PRIVATE=$(echo "$API_JSON" | jq -r '.enablePrivateCluster // empty')
-          RANGES=$(echo "$API_JSON" | jq -r '.authorizedIpRanges | @csv')
-          if [ "${ENABLE_PRIVATE}" = "true" ]; then
-            echo "❌ AKS is PRIVATE. Public GitHub runner cannot reach the API. Use a VNet self-hosted runner or Cloud Shell in VNet."
-            exit 1
-          fi
-          if [ -n "$RANGES" ] && [ "$RANGES" != "\"\"" ]; then
-            echo "⚠️ AKS has Authorized IP ranges: $RANGES"
-            echo "Runner may be blocked. Consider setting OPEN_AKS_API=true to clear ranges during CI."
-          else
-            echo "✅ No authorized IP ranges; API should be reachable."
-          fi
-
-      - name: (Optional) Temporarily open AKS API (clear authorized IP ranges)
-        if: env.OPEN_AKS_API == 'true'
-        run: |
-          az aks update -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" --api-server-authorized-ip-ranges ""
-          echo "✅ Cleared authorized IP ranges; AKS API is publicly reachable."
-
+      # --- Connect to AKS ---
       - name: Get AKS credentials
         run: |
-          az aks get-credentials --name "$CLUSTER_NAME" --resource-group "$RESOURCE_GROUP" --overwrite-existing
-          kubectl cluster-info || (echo "❌ kubectl cannot reach AKS API. Check authorized IP ranges or private cluster settings."; exit 1)
+          az aks get-credentials \
+            --name "$CLUSTER_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --overwrite-existing
+          kubectl cluster-info
 
-      # ---------- Admin-secret approach ----------
+      # --- Admin-secret approach: bypass RBAC/ABAC for pulls ---
       - name: Enable ACR admin user (idempotent)
         run: |
           az acr update -n "$ACR_NAME" --admin-enabled true
@@ -107,6 +101,7 @@ jobs:
             --docker-password="$PASS" \
             -n "${{ steps.vars.outputs.NAMESPACE }}"
 
+      # --- Apply app manifests ---
       - name: Validate manifests path exists
         run: |
           if [ ! -d "${MANIFEST_DIR}" ]; then
@@ -114,7 +109,7 @@ jobs:
             exit 1
           fi
 
-      - name: Apply Kubernetes manifests
+      - name: Apply Kubernetes manifests (Deployment/Service/etc.)
         run: |
           kubectl apply -n "${{ steps.vars.outputs.NAMESPACE }}" -f "${MANIFEST_DIR}"
 
@@ -141,19 +136,89 @@ jobs:
             -n "${{ steps.vars.outputs.NAMESPACE }}" \
             --timeout=300s
 
+      # --- Expose Service as LoadBalancer (idempotent) ---
+      - name: Ensure Service is LoadBalancer
+        run: |
+          # If Service exists, patch type; else create a minimal LoadBalancer Service.
+          if kubectl get svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" >/dev/null 2>&1; then
+            kubectl patch svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" --type='strategic' \
+              -p '{"spec":{"type":"LoadBalancer","ports":[{"name":"http","port":80,"targetPort":8085}]}}'
+          else
+            cat <<'YAML' | kubectl apply -n "${{ steps.vars.outputs.NAMESPACE }}" -f -
+            apiVersion: v1
+            kind: Service
+            metadata:
+              name: webapp
+            spec:
+              type: LoadBalancer
+              selector:
+                app: webapp
+              ports:
+                - name: http
+                  port: 80
+                  targetPort: 8085
+            YAML
+          fi
+
+      - name: (Optional) Annotate Service for static IP
+        if: env.USE_STATIC_IP == 'true'
+        run: |
+          kubectl annotate svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" \
+            "service.beta.kubernetes.io/azure-load-balancer-resource-group=${LB_RESOURCE_GROUP}" \
+            "service.beta.kubernetes.io/azure-load-balancer-ip=${STATIC_IP_NAME}" \
+            --overwrite
+
+      # --- Wait for External IP ---
+      - name: Wait for External IP
+        id: wait_ip
+        run: |
+          echo "Waiting for External IP for Service 'webapp' in namespace '${{ steps.vars.outputs.NAMESPACE }}' ..."
+          for i in {1..30}; do
+            IP=$(kubectl get svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$IP" ]; then
+              echo "External IP: $IP"
+              echo "external_ip=$IP" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Still pending... retrying in 10s"
+            sleep 10
+          done
+          echo "❌ Timed out waiting for External IP"
+          kubectl describe svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" || true
+          exit 1
+
+      # --- Smoke Test (HTTP 200) ---
+      - name: Smoke Test (HTTP 200)
+        run: |
+          IP="${{ steps.wait_ip.outputs.external_ip }}"
+          HOST="${{ env.FRIENDLY_HOSTNAME }}"
+          URL="http://${IP}/"
+          if [ -n "$HOST" ]; then
+            # If you later map DNS to the static IP, also test hostname
+            echo "Testing DNS host: http://${HOST}/"
+          fi
+          echo "Testing: ${URL}"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ App is reachable at ${URL} (HTTP 200)"
+              exit 0
+            fi
+            echo "Got $STATUS, retrying in 10s..."
+            sleep 10
+          done
+          echo "❌ App did not return 200 OK from ${URL}"
+          exit 1
+
+      # --- Print URL / Output for downstream jobs ---
+      - name: Output App URL
+        id: appurl
+        run: |
+          echo "url=http://${{ steps.wait_ip.outputs.external_ip }}/" >> $GITHUB_OUTPUT
+          echo "App URL: http://${{ steps.wait_ip.outputs.external_ip }}/"
+
       - name: Show resources
         run: |
           kubectl get deploy,rs,pods,svc,ingress -n "${{ steps.vars.outputs.NAMESPACE }}"
           echo "Deployed image: ${{ steps.vars.outputs.IMAGE }}"
-
-      - name: Diagnostics (if pods failing)
-        if: failure()
-        run: |
-          kubectl get events -n "${{ steps.vars.outputs.NAMESPACE }}" --sort-by=.lastTimestamp | tail -n 100
-          for p in $(kubectl get pods -n "${{ steps.vars.outputs.NAMESPACE }}" -o jsonpath='{.items[*].metadata.name}'); do
-            echo "---- Describe $p ----"
-            kubectl describe pod "$p" -n "${{ steps.vars.outputs.NAMESPACE }}" || true
-            echo "---- Logs (webapp) $p ----"
-            kubectl logs "$p" -n "${{ steps.vars.outputs.NAMESPACE }}" --container webapp --tail=200 || true
-            echo "---- Previous Logs (webapp) $p ----"
-            kubectl logs "$p" -n "${{ steps.vars.outputs.NAMESPACE }}" --container webapp --previous --tail=200 || true
+          echo "App URL: http://${{ steps.wait_ip.outputs.external_ip }}/"
