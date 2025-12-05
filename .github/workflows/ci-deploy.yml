@@ -137,28 +137,25 @@ jobs:
             --timeout=300s
 
       # --- Expose Service as LoadBalancer (idempotent) ---
-      - name: Ensure Service is LoadBalancer
+      
+      - name: Ensure Service is LoadBalancer (create if missing)
         run: |
-          # If Service exists, patch type; else create a minimal LoadBalancer Service.
-          if kubectl get svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" >/dev/null 2>&1; then
-            kubectl patch svc webapp -n "${{ steps.vars.outputs.NAMESPACE }}" --type='strategic' \
+          set -e
+          NS="${{ steps.vars.outputs.NAMESPACE }}"
+          if kubectl get svc webapp -n "$NS" >/dev/null 2>&1; then
+            echo "Service exists; patching type and ports…"
+            kubectl patch svc webapp -n "$NS" --type='strategic' \
               -p '{"spec":{"type":"LoadBalancer","ports":[{"name":"http","port":80,"targetPort":8085}]}}'
           else
-            cat <<'YAML' | kubectl apply -n "${{ steps.vars.outputs.NAMESPACE }}" -f -
-            apiVersion: v1
-            kind: Service
-            metadata:
-              name: webapp
-            spec:
-              type: LoadBalancer
-              selector:
-                app: webapp
-              ports:
-                - name: http
-                  port: 80
-                  targetPort: 8085
-            YAML
+            echo "Service missing; creating LoadBalancer service…"
+            kubectl create service loadbalancer webapp \
+              --tcp=80:8085 \
+              -n "$NS"
+            # Ensure selector matches your Deployment labels:
+            kubectl patch svc webapp -n "$NS" --type='strategic' \
+              -p '{"spec":{"selector":{"app":"webapp"}}}'
           fi
+
 
       - name: (Optional) Annotate Service for static IP
         if: env.USE_STATIC_IP == 'true'
