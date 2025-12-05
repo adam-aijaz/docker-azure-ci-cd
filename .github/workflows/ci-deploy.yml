@@ -23,7 +23,7 @@ env:
   ACR_NAME: mydockeracrtst
   IMAGE_NAME: webapp
   MANIFEST_DIR: k8s
-  OPEN_AKS_API: "false"   # set to "true" if you want to clear authorized IP ranges automatically
+  OPEN_AKS_API: "true"   # set to "true" if you want to clear authorized IP ranges automatically
 
 jobs:
   deploy:
